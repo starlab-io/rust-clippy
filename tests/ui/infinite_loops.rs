@@ -1,23 +1,28 @@
 //@no-rustfix
+//@aux-build:proc_macros.rs
+
 #![allow(clippy::never_loop)]
 #![warn(clippy::infinite_loop)]
+
+extern crate proc_macros;
+use proc_macros::{external, with_span};
 
 fn do_something() {}
 
 fn no_break() {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         do_something();
     }
 }
 
 fn all_inf() {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             loop {
-                //~^ ERROR: infinite loop detected
+                //~^ infinite_loop
                 do_something();
             }
         }
@@ -31,7 +36,7 @@ fn no_break_return_some_ty() -> Option<u8> {
         return None;
     }
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         do_something();
     }
 }
@@ -44,6 +49,7 @@ fn no_break_never_ret() -> ! {
 
 fn no_break_never_ret_noise() {
     loop {
+        //~^ infinite_loop
         fn inner_fn() -> ! {
             std::process::exit(0);
         }
@@ -87,7 +93,7 @@ fn has_indirect_break_2(stop_num: i32) {
 
 fn break_inner_but_not_outer_1(cond: bool) {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         loop {
             if cond {
                 break;
@@ -98,7 +104,7 @@ fn break_inner_but_not_outer_1(cond: bool) {
 
 fn break_inner_but_not_outer_2(cond: bool) {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         'inner: loop {
             loop {
                 if cond {
@@ -112,7 +118,7 @@ fn break_inner_but_not_outer_2(cond: bool) {
 fn break_outer_but_not_inner() {
     loop {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
         break;
@@ -132,10 +138,10 @@ fn can_break_both_inner_and_outer(cond: bool) {
 }
 
 fn break_wrong_loop(cond: bool) {
-    // 'inner has statement to break 'outer loop, but it was breaked early by a labeled child loop
+    // 'inner has statement to break 'outer loop, but it was broken out of early by a labeled child loop
     'outer: loop {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             'inner: loop {
                 loop {
                     loop {
@@ -175,7 +181,7 @@ enum Foo {
 fn match_like() {
     let opt: Option<u8> = Some(1);
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         match opt {
             Some(v) => {
                 println!("{v}");
@@ -216,12 +222,12 @@ fn match_like() {
     }
 
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         let _x = matches!(result, Ok(v) if v != 0).then_some(0);
     }
 
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         // This `return` does not return the function, so it doesn't count
         let _x = matches!(result, Ok(v) if v != 0).then(|| {
             if true {
@@ -326,7 +332,7 @@ fn exit_directly(cond: bool) {
 trait MyTrait {
     fn problematic_trait_method() {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     }
@@ -336,7 +342,7 @@ trait MyTrait {
 impl MyTrait for String {
     fn could_be_problematic() {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     }
@@ -345,7 +351,7 @@ impl MyTrait for String {
 fn inf_loop_in_closure() {
     let _loop_forever = || {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     };
@@ -359,8 +365,89 @@ fn inf_loop_in_closure() {
 
 fn inf_loop_in_res() -> Result<(), i32> {
     Ok(loop {
+        //~^ infinite_loop
         do_something()
     })
+}
+
+with_span! { span
+    fn no_loop() {}
+}
+
+with_span! { span
+    fn with_loop() {
+        loop {
+            do_nothing();
+        }
+    }
+}
+
+fn do_nothing() {}
+
+fn span_inside_fn() {
+    with_span! { span
+        loop {
+            do_nothing();
+        }
+    }
+}
+
+fn continue_outer() {
+    // Should not lint (issue #13511)
+    let mut count = 0;
+    'outer: loop {
+        if count != 0 {
+            break;
+        }
+
+        loop {
+            count += 1;
+            continue 'outer;
+        }
+    }
+
+    // This should lint as we continue the loop itself
+    'infinite: loop {
+        //~^ infinite_loop
+        loop {
+            continue 'infinite;
+        }
+    }
+    // This should lint as we continue an inner loop
+    loop {
+        //~^ infinite_loop
+        'inner: loop {
+            //~^ infinite_loop
+            loop {
+                continue 'inner;
+            }
+        }
+    }
+
+    // This should lint as we continue the loop itself
+    loop {
+        //~^ infinite_loop
+        continue;
+    }
+}
+
+// don't suggest adding `-> !` to async fn/closure that already returning `-> !`
+mod issue_12338 {
+    use super::do_something;
+
+    async fn foo() -> ! {
+        loop {
+            do_something();
+        }
+    }
+
+    fn bar() {
+        let _ = async || -> ! {
+            loop {
+                do_something();
+            }
+        };
+    }
 }
 
 fn main() {}

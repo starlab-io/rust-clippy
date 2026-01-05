@@ -3,6 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::is_copy;
+use clippy_utils::usage::local_used_in;
 use clippy_utils::{get_enclosing_block, higher, path_to_local, sugg};
 use rustc_ast::ast;
 use rustc_errors::Applicability;
@@ -27,81 +28,81 @@ pub(super) fn check<'tcx>(
         end: Some(end),
         limits,
     }) = higher::Range::hir(arg)
-    {
         // the var must be a single name
-        if let PatKind::Binding(_, canonical_id, _, _) = pat.kind {
-            let mut starts = vec![Start {
-                id: canonical_id,
-                kind: StartKind::Range,
-            }];
+        && let PatKind::Binding(_, canonical_id, _, _) = pat.kind
+    {
+        let mut starts = vec![Start {
+            id: canonical_id,
+            kind: StartKind::Range,
+        }];
 
-            // This is one of few ways to return different iterators
-            // derived from: https://stackoverflow.com/questions/29760668/conditionally-iterate-over-one-of-several-possible-iterators/52064434#52064434
-            let mut iter_a = None;
-            let mut iter_b = None;
+        // This is one of few ways to return different iterators
+        // derived from: https://stackoverflow.com/questions/29760668/conditionally-iterate-over-one-of-several-possible-iterators/52064434#52064434
+        let mut iter_a = None;
+        let mut iter_b = None;
 
-            if let ExprKind::Block(block, _) = body.kind {
-                if let Some(loop_counters) = get_loop_counters(cx, block, expr) {
-                    starts.extend(loop_counters);
-                }
-                iter_a = Some(get_assignments(block, &starts));
-            } else {
-                iter_b = Some(get_assignment(body));
+        if let ExprKind::Block(block, _) = body.kind {
+            if let Some(loop_counters) = get_loop_counters(cx, block, expr) {
+                starts.extend(loop_counters);
             }
+            iter_a = Some(get_assignments(block, &starts));
+        } else {
+            iter_b = Some(get_assignment(body));
+        }
 
-            let assignments = iter_a.into_iter().flatten().chain(iter_b);
+        let assignments = iter_a.into_iter().flatten().chain(iter_b);
 
-            let big_sugg = assignments
-                // The only statements in the for loops can be indexed assignments from
-                // indexed retrievals (except increments of loop counters).
-                .map(|o| {
-                    o.and_then(|(lhs, rhs)| {
-                        let rhs = fetch_cloned_expr(rhs);
-                        if let ExprKind::Index(base_left, idx_left, _) = lhs.kind
+        let big_sugg = assignments
+            // The only statements in the for loops can be indexed assignments from
+            // indexed retrievals (except increments of loop counters).
+            .map(|o| {
+                o.and_then(|(lhs, rhs)| {
+                    let rhs = fetch_cloned_expr(rhs);
+                    if let ExprKind::Index(base_left, idx_left, _) = lhs.kind
                             && let ExprKind::Index(base_right, idx_right, _) = rhs.kind
                             && let Some(ty) = get_slice_like_element_ty(cx, cx.typeck_results().expr_ty(base_left))
                             && get_slice_like_element_ty(cx, cx.typeck_results().expr_ty(base_right)).is_some()
                             && let Some((start_left, offset_left)) = get_details_from_idx(cx, idx_left, &starts)
                             && let Some((start_right, offset_right)) = get_details_from_idx(cx, idx_right, &starts)
-
-                            // Source and destination must be different
+                            && !local_used_in(cx, canonical_id, base_left)
+                            && !local_used_in(cx, canonical_id, base_right)
+							// Source and destination must be different
                             && path_to_local(base_left) != path_to_local(base_right)
-                        {
-                            Some((
-                                ty,
-                                IndexExpr {
-                                    base: base_left,
-                                    idx: start_left,
-                                    idx_offset: offset_left,
-                                },
-                                IndexExpr {
-                                    base: base_right,
-                                    idx: start_right,
-                                    idx_offset: offset_right,
-                                },
-                            ))
-                        } else {
-                            None
-                        }
-                    })
+                    {
+                        Some((
+                            ty,
+                            IndexExpr {
+                                base: base_left,
+                                idx: start_left,
+                                idx_offset: offset_left,
+                            },
+                            IndexExpr {
+                                base: base_right,
+                                idx: start_right,
+                                idx_offset: offset_right,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
                 })
-                .map(|o| o.map(|(ty, dst, src)| build_manual_memcpy_suggestion(cx, start, end, limits, ty, &dst, &src)))
-                .collect::<Option<Vec<_>>>()
-                .filter(|v| !v.is_empty())
-                .map(|v| v.join("\n    "));
+            })
+            .map(|o| o.map(|(ty, dst, src)| build_manual_memcpy_suggestion(cx, start, end, limits, ty, &dst, &src)))
+            .collect::<Option<Vec<_>>>()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.join("\n    "));
 
-            if let Some(big_sugg) = big_sugg {
-                span_lint_and_sugg(
-                    cx,
-                    MANUAL_MEMCPY,
-                    expr.span,
-                    "it looks like you're manually copying between slices",
-                    "try replacing the loop by",
-                    big_sugg,
-                    Applicability::Unspecified,
-                );
-                return true;
-            }
+        if let Some(big_sugg) = big_sugg {
+            span_lint_and_sugg(
+                cx,
+                MANUAL_MEMCPY,
+                expr.span,
+                "it looks like you're manually copying between slices",
+                "try replacing the loop by",
+                big_sugg,
+                Applicability::Unspecified,
+            );
+            return true;
         }
     }
     false
@@ -182,7 +183,12 @@ fn build_manual_memcpy_suggestion<'tcx>(
     {
         dst_base_str
     } else {
-        format!("{dst_base_str}[{}..{}]", dst_offset.maybe_par(), dst_limit.maybe_par()).into()
+        format!(
+            "{dst_base_str}[{}..{}]",
+            dst_offset.maybe_paren(),
+            dst_limit.maybe_paren()
+        )
+        .into()
     };
 
     let method_str = if is_copy(cx, elem_ty) {
@@ -194,7 +200,12 @@ fn build_manual_memcpy_suggestion<'tcx>(
     let src = if is_array_length_equal_to_range(cx, start, end, src.base) {
         src_base_str
     } else {
-        format!("{src_base_str}[{}..{}]", src_offset.maybe_par(), src_limit.maybe_par()).into()
+        format!(
+            "{src_base_str}[{}..{}]",
+            src_offset.maybe_paren(),
+            src_limit.maybe_paren()
+        )
+        .into()
     };
 
     format!("{dst}.{method_str}(&{src});")
@@ -207,7 +218,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
 #[derive(Clone)]
 struct MinifyingSugg<'a>(Sugg<'a>);
 
-impl<'a> Display for MinifyingSugg<'a> {
+impl Display for MinifyingSugg<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -408,13 +419,13 @@ fn get_assignments<'a, 'tcx>(
     stmts
         .iter()
         .filter_map(move |stmt| match stmt.kind {
-            StmtKind::Local(..) | StmtKind::Item(..) => None,
+            StmtKind::Let(..) | StmtKind::Item(..) => None,
             StmtKind::Expr(e) | StmtKind::Semi(e) => Some(e),
         })
         .chain(*expr)
         .filter(move |e| {
             if let ExprKind::AssignOp(_, place, _) = e.kind {
-                path_to_local(place).map_or(false, |id| {
+                path_to_local(place).is_some_and(|id| {
                     !loop_counters
                         .iter()
                         // skip the first item which should be `StartKind::Range`
@@ -461,7 +472,7 @@ fn is_array_length_equal_to_range(cx: &LateContext<'_>, start: &Expr<'_>, end: &
         if let ExprKind::Lit(lit) = expr.kind
             && let ast::LitKind::Int(value, _) = lit.node
         {
-            Some(value)
+            Some(value.get())
         } else {
             None
         }
@@ -470,7 +481,7 @@ fn is_array_length_equal_to_range(cx: &LateContext<'_>, start: &Expr<'_>, end: &
     let arr_ty = cx.typeck_results().expr_ty(arr).peel_refs();
 
     if let ty::Array(_, s) = arr_ty.kind() {
-        let size: u128 = if let Some(size) = s.try_eval_target_usize(cx.tcx, cx.param_env) {
+        let size: u128 = if let Some(size) = s.try_to_target_usize(cx.tcx) {
             size.into()
         } else {
             return false;

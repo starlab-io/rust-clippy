@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 //@no-rustfix
+//@require-annotations-for-level: WARN
 extern crate futures;
 use futures::io::{AsyncRead, AsyncReadExt};
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncReadExt as _, AsyncWrite as TokioAsyncWrite, AsyncWriteExt as _};
@@ -110,6 +111,12 @@ async fn test_tokio<R: TokioAsyncRead + Unpin>(r: &mut R) {
     let mut data2 = Vec::new();
     r.read_exact(&mut data2).await.unwrap();
     //~^ ERROR: reading zero byte data to `Vec`
+}
+
+fn allow_works<F: std::io::Read>(mut f: F) {
+    let mut data = Vec::with_capacity(100);
+    #[allow(clippy::read_zero_byte_vec)]
+    f.read(&mut data).unwrap();
 }
 
 fn main() {}

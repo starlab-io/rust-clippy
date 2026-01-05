@@ -51,8 +51,8 @@ impl<'tcx> LateLintPass<'tcx> for SelfNamedConstructors {
             _ => return,
         }
 
-        let parent = cx.tcx.hir().get_parent_item(impl_item.hir_id()).def_id;
-        let item = cx.tcx.hir().expect_item(parent);
+        let parent = cx.tcx.hir_get_parent_item(impl_item.hir_id()).def_id;
+        let item = cx.tcx.hir_expect_item(parent);
         let self_ty = cx.tcx.type_of(item.owner_id).instantiate_identity();
         let ret_ty = return_ty(cx, impl_item.owner_id);
 
@@ -72,9 +72,9 @@ impl<'tcx> LateLintPass<'tcx> for SelfNamedConstructors {
 
         if let Some(self_def) = self_ty.ty_adt_def()
             && let Some(self_local_did) = self_def.did().as_local()
-            && let self_id = cx.tcx.local_def_id_to_hir_id(self_local_did)
-            && let Some(Node::Item(x)) = cx.tcx.opt_hir_node(self_id)
-            && let type_name = x.ident.name.as_str().to_lowercase()
+            && let Node::Item(x) = cx.tcx.hir_node_by_def_id(self_local_did)
+            && let Some(type_ident) = x.kind.ident()
+            && let type_name = type_ident.name.as_str().to_lowercase()
             && (impl_item.ident.name.as_str() == type_name
                 || impl_item.ident.name.as_str().replace('_', "") == type_name)
         {
@@ -82,7 +82,7 @@ impl<'tcx> LateLintPass<'tcx> for SelfNamedConstructors {
                 cx,
                 SELF_NAMED_CONSTRUCTORS,
                 impl_item.span,
-                &format!("constructor `{}` has the same name as the type", impl_item.ident.name),
+                format!("constructor `{}` has the same name as the type", impl_item.ident.name),
             );
         }
     }

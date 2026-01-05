@@ -58,7 +58,7 @@ fn is_overly_generic_error_type(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
     }
     if is_type_lang_item(cx, ty, LangItem::OwnedBox) {
         let inner = ty.boxed_ty();
-        if let ty::Dynamic(predicates, _, _) = inner.kind() {
+        if let ty::Dynamic(predicates, _, _) = inner.expect("REASON").kind() {
             if predicates.iter().any(|predicate| {
                 if let ExistentialPredicate::Trait(trait_) = predicate.skip_binder() {
                     cx.tcx.is_diagnostic_item(sym::Error, trait_.def_id)
@@ -117,7 +117,7 @@ impl<'tcx> LateLintPass<'tcx> for LibraryCratesStructuredErrors {
         //We are looking for functions that return anyhow::Result or
         // Result<_, Box<dyn Error>> or Result<_, String>
         if let FnKind::Method(_, _) | FnKind::ItemFn(_, _, _) = fn_kind {
-            if let Some((hir_ty, err_ty)) = result_err_ty(cx, fn_, local_def_id, span)
+            if let Some((hir_ty, err_ty)) = result_err_ty(cx, *fn_, local_def_id, span)
                 && is_overly_generic_error_type(cx, err_ty)
             {
                 span_lint_and_note(

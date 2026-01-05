@@ -1,9 +1,11 @@
 mod common_metadata;
 mod feature_name;
+mod lint_groups_priority;
 mod multiple_crate_versions;
 mod wildcard_dependencies;
 
 use cargo_metadata::MetadataCommand;
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::is_lint_allowed;
 use rustc_data_structures::fx::FxHashSet;
@@ -159,15 +161,61 @@ declare_clippy_lint! {
     /// [dependencies]
     /// regex = "*"
     /// ```
+    /// Use instead:
+    /// ```toml
+    /// [dependencies]
+    /// # allow patch updates, but not minor or major version changes
+    /// some_crate_1 = "~1.2.3"
+    ///
+    /// # pin the version to a specific version
+    /// some_crate_2 = "=1.2.3"
+    /// ```
     #[clippy::version = "1.32.0"]
     pub WILDCARD_DEPENDENCIES,
     cargo,
     "wildcard dependencies being used"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for lint groups with the same priority as lints in the `Cargo.toml`
+    /// [`[lints]` table](https://doc.rust-lang.org/cargo/reference/manifest.html#the-lints-section).
+    ///
+    /// This lint will be removed once [cargo#12918](https://github.com/rust-lang/cargo/issues/12918)
+    /// is resolved.
+    ///
+    /// ### Why is this bad?
+    /// The order of lints in the `[lints]` is ignored, to have a lint override a group the
+    /// `priority` field needs to be used, otherwise the sort order is undefined.
+    ///
+    /// ### Known problems
+    /// Does not check lints inherited using `lints.workspace = true`
+    ///
+    /// ### Example
+    /// ```toml
+    /// # Passed as `--allow=clippy::similar_names --warn=clippy::pedantic`
+    /// # which results in `similar_names` being `warn`
+    /// [lints.clippy]
+    /// pedantic = "warn"
+    /// similar_names = "allow"
+    /// ```
+    /// Use instead:
+    /// ```toml
+    /// # Passed as `--warn=clippy::pedantic --allow=clippy::similar_names`
+    /// # which results in `similar_names` being `allow`
+    /// [lints.clippy]
+    /// pedantic = { level = "warn", priority = -1 }
+    /// similar_names = "allow"
+    /// ```
+    #[clippy::version = "1.78.0"]
+    pub LINT_GROUPS_PRIORITY,
+    correctness,
+    "a lint group in `Cargo.toml` at the same priority as a lint"
+}
+
 pub struct Cargo {
-    pub allowed_duplicate_crates: FxHashSet<String>,
-    pub ignore_publish: bool,
+    allowed_duplicate_crates: FxHashSet<String>,
+    ignore_publish: bool,
 }
 
 impl_lint_pass!(Cargo => [
@@ -175,8 +223,18 @@ impl_lint_pass!(Cargo => [
     REDUNDANT_FEATURE_NAMES,
     NEGATIVE_FEATURE_NAMES,
     MULTIPLE_CRATE_VERSIONS,
-    WILDCARD_DEPENDENCIES
+    WILDCARD_DEPENDENCIES,
+    LINT_GROUPS_PRIORITY,
 ]);
+
+impl Cargo {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            allowed_duplicate_crates: conf.allowed_duplicate_crates.iter().cloned().collect(),
+            ignore_publish: conf.cargo_ignore_publish,
+        }
+    }
+}
 
 impl LateLintPass<'_> for Cargo {
     fn check_crate(&mut self, cx: &LateContext<'_>) {
@@ -187,6 +245,8 @@ impl LateLintPass<'_> for Cargo {
             WILDCARD_DEPENDENCIES,
         ];
         static WITH_DEPS_LINTS: &[&Lint] = &[MULTIPLE_CRATE_VERSIONS];
+
+        lint_groups_priority::check(cx);
 
         if !NO_DEPS_LINTS
             .iter()
@@ -200,7 +260,7 @@ impl LateLintPass<'_> for Cargo {
                 },
                 Err(e) => {
                     for lint in NO_DEPS_LINTS {
-                        span_lint(cx, lint, DUMMY_SP, &format!("could not read cargo metadata: {e}"));
+                        span_lint(cx, lint, DUMMY_SP, format!("could not read cargo metadata: {e}"));
                     }
                 },
             }
@@ -216,7 +276,7 @@ impl LateLintPass<'_> for Cargo {
                 },
                 Err(e) => {
                     for lint in WITH_DEPS_LINTS {
-                        span_lint(cx, lint, DUMMY_SP, &format!("could not read cargo metadata: {e}"));
+                        span_lint(cx, lint, DUMMY_SP, format!("could not read cargo metadata: {e}"));
                     }
                 },
             }

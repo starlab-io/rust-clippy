@@ -1,15 +1,16 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::numeric_literal::NumericLiteral;
-use clippy_utils::source::snippet_opt;
-use clippy_utils::visitors::{for_each_expr, Visitable};
-use clippy_utils::{get_parent_expr, get_parent_node, is_hir_ty_cfg_dependant, is_ty_alias, path_to_local};
+use clippy_utils::source::{SpanRangeExt, snippet_opt};
+use clippy_utils::visitors::{Visitable, for_each_expr_without_closures};
+use clippy_utils::{get_parent_expr, is_hir_ty_cfg_dependant, is_ty_alias, path_to_local};
 use rustc_ast::{LitFloatType, LitIntType, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{Expr, ExprKind, Lit, Node, Path, QPath, TyKind, UnOp};
 use rustc_lint::{LateContext, LintContext};
-use rustc_middle::lint::in_external_macro;
+use rustc_middle::ty::adjustment::Adjust;
 use rustc_middle::ty::{self, FloatTy, InferTy, Ty};
+use rustc_span::{Symbol, sym};
 use std::ops::ControlFlow;
 
 use super::UNNECESSARY_CAST;
@@ -43,7 +44,7 @@ pub(super) fn check<'tcx>(
                 }
             },
             // Ignore `p as *const _`
-            TyKind::Infer => return false,
+            TyKind::Infer(()) => return false,
             _ => {},
         }
 
@@ -51,7 +52,7 @@ pub(super) fn check<'tcx>(
             cx,
             UNNECESSARY_CAST,
             expr.span,
-            &format!(
+            format!(
                 "casting raw pointers to the same type and constness is unnecessary (`{cast_from}` -> `{cast_to}`)"
             ),
             "try",
@@ -65,8 +66,8 @@ pub(super) fn check<'tcx>(
         && let ExprKind::Path(qpath) = inner.kind
         && let QPath::Resolved(None, Path { res, .. }) = qpath
         && let Res::Local(hir_id) = res
-        && let parent = cx.tcx.hir().get_parent(*hir_id)
-        && let Node::Local(local) = parent
+        && let parent = cx.tcx.parent_hir_node(*hir_id)
+        && let Node::LetStmt(local) = parent
     {
         if let Some(ty) = local.ty
             && let TyKind::Path(qpath) = ty.kind
@@ -104,10 +105,10 @@ pub(super) fn check<'tcx>(
         let literal_str = &cast_str;
 
         if let LitKind::Int(n, _) = lit.node
-            && let Some(src) = snippet_opt(cx, cast_expr.span)
+            && let Some(src) = cast_expr.span.get_source_text(cx)
             && cast_to.is_floating_point()
             && let Some(num_lit) = NumericLiteral::from_lit_kind(&src, &lit.node)
-            && let from_nbits = 128 - n.leading_zeros()
+            && let from_nbits = 128 - n.get().leading_zeros()
             && let to_nbits = fp_ty_mantissa_nbits(cast_to)
             && from_nbits != 0
             && to_nbits != 0
@@ -131,37 +132,73 @@ pub(super) fn check<'tcx>(
             | LitKind::Float(_, LitFloatType::Suffixed(_))
                 if cast_from.kind() == cast_to.kind() =>
             {
-                if let Some(src) = snippet_opt(cx, cast_expr.span) {
-                    if let Some(num_lit) = NumericLiteral::from_lit_kind(&src, &lit.node) {
-                        lint_unnecessary_cast(cx, expr, num_lit.integer, cast_from, cast_to);
-                        return true;
-                    }
+                if let Some(src) = cast_expr.span.get_source_text(cx)
+                    && let Some(num_lit) = NumericLiteral::from_lit_kind(&src, &lit.node)
+                {
+                    lint_unnecessary_cast(cx, expr, num_lit.integer, cast_from, cast_to);
+                    return true;
                 }
             },
             _ => {},
         }
     }
 
-    if cast_from.kind() == cast_to.kind() && !in_external_macro(cx.sess(), expr.span) {
+    if cast_from.kind() == cast_to.kind() && !expr.span.in_external_macro(cx.sess().source_map()) {
+        enum MaybeParenOrBlock {
+            Paren,
+            Block,
+            Nothing,
+        }
+
+        fn is_borrow_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+            matches!(expr.kind, ExprKind::AddrOf(..))
+                || cx
+                    .typeck_results()
+                    .expr_adjustments(expr)
+                    .first()
+                    .is_some_and(|adj| matches!(adj.kind, Adjust::Borrow(_)))
+        }
+
+        fn is_in_allowed_macro(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+            const ALLOWED_MACROS: &[Symbol] = &[
+                sym::format_args_macro,
+                sym::assert_eq_macro,
+                sym::debug_assert_eq_macro,
+                sym::assert_ne_macro,
+                sym::debug_assert_ne_macro,
+            ];
+            matches!(expr.span.ctxt().outer_expn_data().macro_def_id, Some(def_id) if 
+                cx.tcx.get_diagnostic_name(def_id).is_some_and(|sym| ALLOWED_MACROS.contains(&sym)))
+        }
+
         if let Some(id) = path_to_local(cast_expr)
-            && let Some(span) = cx.tcx.hir().opt_span(id)
-            && !span.eq_ctxt(cast_expr.span)
+            && !cx.tcx.hir_span(id).eq_ctxt(cast_expr.span)
         {
             // Binding context is different than the identifiers context.
             // Weird macro wizardry could be involved here.
             return false;
         }
 
+        // Changing `&(x as i32)` to `&x` would change the meaning of the code because the previous creates
+        // a reference to the temporary while the latter creates a reference to the original value.
+        let surrounding = match cx.tcx.parent_hir_node(expr.hir_id) {
+            Node::Expr(parent) if is_borrow_expr(cx, parent) && !is_in_allowed_macro(cx, parent) => {
+                MaybeParenOrBlock::Block
+            },
+            Node::Expr(parent) if cast_expr.precedence() < parent.precedence() => MaybeParenOrBlock::Paren,
+            _ => MaybeParenOrBlock::Nothing,
+        };
+
         span_lint_and_sugg(
             cx,
             UNNECESSARY_CAST,
             expr.span,
-            &format!("casting to the same type is unnecessary (`{cast_from}` -> `{cast_to}`)"),
+            format!("casting to the same type is unnecessary (`{cast_from}` -> `{cast_to}`)"),
             "try",
-            if get_parent_expr(cx, expr).map_or(false, |e| matches!(e.kind, ExprKind::AddrOf(..))) {
-                format!("{{ {cast_str} }}")
-            } else {
-                cast_str
+            match surrounding {
+                MaybeParenOrBlock::Paren => format!("({cast_str})"),
+                MaybeParenOrBlock::Block => format!("{{ {cast_str} }}"),
+                MaybeParenOrBlock::Nothing => cast_str,
             },
             Applicability::MachineApplicable,
         );
@@ -199,7 +236,7 @@ fn lint_unnecessary_cast(
         cx,
         UNNECESSARY_CAST,
         expr.span,
-        &format!("casting {literal_kind_name} literal to `{cast_to}` is unnecessary"),
+        format!("casting {literal_kind_name} literal to `{cast_to}` is unnecessary"),
         "try",
         sugg,
         Applicability::MachineApplicable,
@@ -235,7 +272,7 @@ fn fp_ty_mantissa_nbits(typ: Ty<'_>) -> u32 {
 /// TODO: Maybe we should move this to `clippy_utils` so others won't need to go down this dark,
 /// dark path reimplementing this (or something similar).
 fn is_cast_from_ty_alias<'tcx>(cx: &LateContext<'tcx>, expr: impl Visitable<'tcx>, cast_from: Ty<'tcx>) -> bool {
-    for_each_expr(expr, |expr| {
+    for_each_expr_without_closures(expr, |expr| {
         // Calls are a `Path`, and usage of locals are a `Path`. So, this checks
         // - call() as i32
         // - local as i32
@@ -243,7 +280,7 @@ fn is_cast_from_ty_alias<'tcx>(cx: &LateContext<'tcx>, expr: impl Visitable<'tcx
             let res = cx.qpath_res(&qpath, expr.hir_id);
             // Function call
             if let Res::Def(DefKind::Fn, def_id) = res {
-                let Some(snippet) = snippet_opt(cx, cx.tcx.def_span(def_id)) else {
+                let Some(snippet) = cx.tcx.def_span(def_id).get_source_text(cx) else {
                     return ControlFlow::Continue(());
                 };
                 // This is the worst part of this entire function. This is the only way I know of to
@@ -258,15 +295,13 @@ fn is_cast_from_ty_alias<'tcx>(cx: &LateContext<'tcx>, expr: impl Visitable<'tcx
                 if !snippet
                     .split("->")
                     .skip(1)
-                    .map(|s| snippet_eq_ty(s, cast_from) || s.split("where").any(|ty| snippet_eq_ty(ty, cast_from)))
-                    .any(|a| a)
+                    .any(|s| snippet_eq_ty(s, cast_from) || s.split("where").any(|ty| snippet_eq_ty(ty, cast_from)))
                 {
                     return ControlFlow::Break(());
                 }
             // Local usage
             } else if let Res::Local(hir_id) = res
-                && let Some(parent) = get_parent_node(cx.tcx, hir_id)
-                && let Node::Local(l) = parent
+                && let Node::LetStmt(l) = cx.tcx.parent_hir_node(hir_id)
             {
                 if let Some(e) = l.init
                     && is_cast_from_ty_alias(cx, e, cast_from)
