@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::{implements_trait, is_copy};
-use rustc_ast::BindingAnnotation;
+use rustc_ast::BindingMode;
 use rustc_errors::Applicability;
 use rustc_hir::{Body, Expr, ExprKind, HirId, HirIdSet, PatKind};
 use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
@@ -12,7 +12,6 @@ use rustc_span::sym;
 
 use super::ITER_OVEREAGER_CLONED;
 use crate::redundant_clone::REDUNDANT_CLONE;
-use crate::rustc_trait_selection::infer::TyCtxtInferExt;
 
 #[derive(Clone, Copy)]
 pub(super) enum Op<'a> {
@@ -49,7 +48,7 @@ pub(super) fn check<'tcx>(
         && let Some(method_id) = typeck.type_dependent_def_id(cloned_call.hir_id)
         && cx.tcx.trait_of_item(method_id) == Some(iter_id)
         && let cloned_recv_ty = typeck.expr_ty_adjusted(cloned_recv)
-        && let Some(iter_assoc_ty) = cx.get_associated_type(cloned_recv_ty, iter_id, "Item")
+        && let Some(iter_assoc_ty) = cx.get_associated_type(cloned_recv_ty, iter_id, sym::Item)
         && matches!(*iter_assoc_ty.kind(), ty::Ref(_, ty, _) if !is_copy(cx, ty))
     {
         if needs_into_iter
@@ -60,25 +59,19 @@ pub(super) fn check<'tcx>(
         }
 
         if let Op::NeedlessMove(expr) = op {
-            let rustc_hir::ExprKind::Closure(closure) = expr.kind else {
+            let ExprKind::Closure(closure) = expr.kind else {
                 return;
             };
-            let body @ Body { params: [p], .. } = cx.tcx.hir().body(closure.body) else {
+            let body @ Body { params: [p], .. } = cx.tcx.hir_body(closure.body) else {
                 return;
             };
             let mut delegate = MoveDelegate {
                 used_move: HirIdSet::default(),
             };
-            let infcx = cx.tcx.infer_ctxt().build();
 
-            ExprUseVisitor::new(
-                &mut delegate,
-                &infcx,
-                closure.body.hir_id.owner.def_id,
-                cx.param_env,
-                cx.typeck_results(),
-            )
-            .consume_body(body);
+            ExprUseVisitor::for_clippy(cx, closure.def_id, &mut delegate)
+                .consume_body(body)
+                .into_ok();
 
             let mut to_be_discarded = false;
 
@@ -89,8 +82,7 @@ pub(super) fn check<'tcx>(
                 }
 
                 match it.kind {
-                    PatKind::Binding(BindingAnnotation(_, Mutability::Mut), _, _, _)
-                    | PatKind::Ref(_, Mutability::Mut) => {
+                    PatKind::Binding(BindingMode(_, Mutability::Mut), _, _, _) | PatKind::Ref(_, Mutability::Mut) => {
                         to_be_discarded = true;
                         false
                     },
@@ -154,6 +146,8 @@ impl<'tcx> Delegate<'tcx> for MoveDelegate {
             self.used_move.insert(l);
         }
     }
+
+    fn use_cloned(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId) {}
 
     fn borrow(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId, _: BorrowKind) {}
 

@@ -1,6 +1,7 @@
+use clippy_config::Conf;
 use clippy_config::types::PubUnderscoreFieldsBehaviour;
 use clippy_utils::attrs::is_doc_hidden;
-use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::is_path_lang_item;
 use rustc_hir::{FieldDef, Item, ItemKind, LangItem};
 use rustc_lint::{LateContext, LateLintPass};
@@ -42,14 +43,22 @@ declare_clippy_lint! {
 }
 
 pub struct PubUnderscoreFields {
-    pub behavior: PubUnderscoreFieldsBehaviour,
+    behavior: PubUnderscoreFieldsBehaviour,
 }
 impl_lint_pass!(PubUnderscoreFields => [PUB_UNDERSCORE_FIELDS]);
+
+impl PubUnderscoreFields {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            behavior: conf.pub_underscore_fields_behavior,
+        }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for PubUnderscoreFields {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
         // This lint only pertains to structs.
-        let ItemKind::Struct(variant_data, _) = &item.kind else {
+        let ItemKind::Struct(_, variant_data, _) = &item.kind else {
             return;
         };
 
@@ -65,17 +74,19 @@ impl<'tcx> LateLintPass<'tcx> for PubUnderscoreFields {
             // Only pertains to fields that start with an underscore, and are public.
             if field.ident.as_str().starts_with('_') && is_visible(field)
                 // We ignore fields that have `#[doc(hidden)]`.
-                && !is_doc_hidden(cx.tcx.hir().attrs(field.hir_id))
+                && !is_doc_hidden(cx.tcx.hir_attrs(field.hir_id))
                 // We ignore fields that are `PhantomData`.
                 && !is_path_lang_item(cx, field.ty, LangItem::PhantomData)
             {
-                span_lint_and_help(
+                span_lint_hir_and_then(
                     cx,
                     PUB_UNDERSCORE_FIELDS,
+                    field.hir_id,
                     field.vis_span.to(field.ident.span),
                     "field marked as public but also inferred as unused because it's prefixed with `_`",
-                    None,
-                    "consider removing the underscore, or making the field private",
+                    |diag| {
+                        diag.help("consider removing the underscore, or making the field private");
+                    },
                 );
             }
         }

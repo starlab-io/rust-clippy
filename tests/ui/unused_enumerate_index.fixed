@@ -1,11 +1,16 @@
-#![allow(unused)]
+#![allow(unused, clippy::map_identity)]
 #![warn(clippy::unused_enumerate_index)]
 
 use std::iter::Enumerate;
 
+fn get_enumerate() -> Enumerate<std::vec::IntoIter<i32>> {
+    vec![1].into_iter().enumerate()
+}
+
 fn main() {
     let v = [1, 2, 3];
     for x in v.iter() {
+        //~^ unused_enumerate_index
         println!("{x}");
     }
 
@@ -53,6 +58,57 @@ fn main() {
 
     let dummy = Dummy3(vec![1, 2, 3].into_iter());
     for x in dummy {
+        //~^ unused_enumerate_index
         println!("{x}");
     }
+
+    let _ = vec![1, 2, 3].into_iter().map(|x| println!("{x}"));
+    //~^ unused_enumerate_index
+
+    let p = vec![1, 2, 3].into_iter();
+    //~^ unused_enumerate_index
+    p.map(|x| println!("{x}"));
+
+    // This shouldn't trigger the lint. `get_enumerate` may come from an external library on which we
+    // have no control.
+    let p = get_enumerate();
+    p.map(|(_, x)| println!("{x}"));
+
+    // This shouldn't trigger the lint. The `enumerate` call is in a different context.
+    macro_rules! mac {
+        () => {
+            [1].iter().enumerate()
+        };
+    }
+    _ = mac!().map(|(_, v)| v);
+
+    macro_rules! mac2 {
+        () => {
+            [1].iter()
+        };
+    }
+    _ = mac2!().map(|_v| {});
+    //~^ unused_enumerate_index
+
+    // This shouldn't trigger the lint because of the `allow`.
+    #[allow(clippy::unused_enumerate_index)]
+    let v = [1].iter().enumerate();
+    v.map(|(_, _x)| {});
+
+    // This should keep the explicit type of `x`.
+    let v = [1, 2, 3].iter().copied();
+    //~^ unused_enumerate_index
+    let x = v.map(|x: i32| x).sum::<i32>();
+    assert_eq!(x, 6);
+
+    // This should keep the explicit type of `x`.
+    let v = [1, 2, 3].iter().copied();
+    //~^ unused_enumerate_index
+    let x = v.map(|x: i32| x).sum::<i32>();
+    assert_eq!(x, 6);
+
+    let v = [1, 2, 3].iter().copied();
+    //~^ unused_enumerate_index
+    let x = v.map(|x| x).sum::<i32>();
+    assert_eq!(x, 6);
 }

@@ -3,18 +3,18 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{HirId, Impl, ItemKind, Node, Path, QPath, TraitRef, TyKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::AssocKind;
+use rustc_middle::ty::AssocItem;
 use rustc_session::declare_lint_pass;
-use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_span::symbol::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
 
 declare_clippy_lint! {
     /// ### What it does
     /// It lints if a struct has two methods with the same name:
-    /// one from a trait, another not from trait.
+    /// one from a trait, another not from a trait.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Confusing.
     ///
     /// ### Example
@@ -47,13 +47,12 @@ struct ExistingName {
 }
 
 impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
-    #[expect(clippy::too_many_lines)]
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
         let mut map = FxHashMap::<Res, ExistingName>::default();
 
-        for id in cx.tcx.hir().items() {
+        for id in cx.tcx.hir_free_items() {
             if matches!(cx.tcx.def_kind(id.owner_id), DefKind::Impl { .. })
-                && let item = cx.tcx.hir().item(id)
+                && let item = cx.tcx.hir_item(id)
                 && let ItemKind::Impl(Impl {
                     items,
                     of_trait,
@@ -75,24 +74,23 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
 
                 match of_trait {
                     Some(trait_ref) => {
-                        let mut methods_in_trait: BTreeSet<Symbol> =
-                            if let Some(Node::TraitRef(TraitRef { path, .. })) =
-                                cx.tcx.opt_hir_node(trait_ref.hir_ref_id)
-                                && let Res::Def(DefKind::Trait, did) = path.res
-                            {
-                                // FIXME: if
-                                // `rustc_middle::ty::assoc::AssocItems::items` is public,
-                                // we can iterate its keys instead of `in_definition_order`,
-                                // which's more efficient
-                                cx.tcx
-                                    .associated_items(did)
-                                    .in_definition_order()
-                                    .filter(|assoc_item| matches!(assoc_item.kind, AssocKind::Fn))
-                                    .map(|assoc_item| assoc_item.name)
-                                    .collect()
-                            } else {
-                                BTreeSet::new()
-                            };
+                        let mut methods_in_trait: BTreeSet<Symbol> = if let Node::TraitRef(TraitRef { path, .. }) =
+                            cx.tcx.hir_node(trait_ref.hir_ref_id)
+                            && let Res::Def(DefKind::Trait, did) = path.res
+                        {
+                            // FIXME: if
+                            // `rustc_middle::ty::assoc::AssocItems::items` is public,
+                            // we can iterate its keys instead of `in_definition_order`,
+                            // which's more efficient
+                            cx.tcx
+                                .associated_items(did)
+                                .in_definition_order()
+                                .filter(|assoc_item| assoc_item.is_fn())
+                                .map(AssocItem::name)
+                                .collect()
+                        } else {
+                            BTreeSet::new()
+                        };
 
                         let mut check_trait_method = |method_name: Symbol, trait_method_span: Span| {
                             if let Some((impl_span, hir_id)) = existing_name.impl_methods.get(&method_name) {

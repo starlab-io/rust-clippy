@@ -1,7 +1,12 @@
 //@aux-build:proc_macro_attr.rs
 
 #![warn(clippy::semicolon_if_nothing_returned)]
-#![allow(clippy::redundant_closure, clippy::uninlined_format_args, clippy::needless_late_init)]
+#![allow(
+    clippy::redundant_closure,
+    clippy::uninlined_format_args,
+    clippy::needless_late_init,
+    clippy::empty_docs
+)]
 
 #[macro_use]
 extern crate proc_macro_attr;
@@ -11,21 +16,25 @@ fn get_unit() {}
 // the functions below trigger the lint
 fn main() {
     println!("Hello")
+    //~^ semicolon_if_nothing_returned
 }
 
 fn hello() {
     get_unit()
+    //~^ semicolon_if_nothing_returned
 }
 
 fn basic101(x: i32) {
     let y: i32;
     y = x + 1
+    //~^ semicolon_if_nothing_returned
 }
 
 #[rustfmt::skip]
 fn closure_error() {
     let _d = || {
         hello()
+        //~^ semicolon_if_nothing_returned
     };
 }
 
@@ -37,6 +46,7 @@ fn unsafe_checks_error() {
     let mut s = MaybeUninit::<String>::uninit();
     let _d = || unsafe {
         ptr::drop_in_place(s.as_mut_ptr())
+        //~^ semicolon_if_nothing_returned
     };
 }
 

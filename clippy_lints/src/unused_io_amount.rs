@@ -1,10 +1,11 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{is_res_lang_ctor, is_trait_method, match_trait_method, paths};
-use hir::{ExprKind, PatKind};
+use clippy_utils::diagnostics::span_lint_hir_and_then;
+use clippy_utils::macros::{is_panic, root_macro_call_first_node};
+use clippy_utils::{is_res_lang_ctor, is_trait_method, match_def_path, match_trait_method, paths, peel_blocks};
+use hir::{ExprKind, HirId, PatKind};
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -33,8 +34,15 @@ declare_clippy_lint! {
     /// ```rust,ignore
     /// use std::io;
     /// fn foo<W: io::Write>(w: &mut W) -> io::Result<()> {
-    ///     // must be `w.write_all(b"foo")?;`
     ///     w.write(b"foo")?;
+    ///     Ok(())
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```rust,ignore
+    /// use std::io;
+    /// fn foo<W: io::Write>(w: &mut W) -> io::Result<()> {
+    ///     w.write_all(b"foo")?;
     ///     Ok(())
     /// }
     /// ```
@@ -60,10 +68,10 @@ impl<'tcx> LateLintPass<'tcx> for UnusedIoAmount {
     ///   we need to check them at `check_expr` or `check_block` as they are not stmts
     ///   but we can't check them at `check_expr` because we need the broader context
     ///   because we should do this only for the final expression of the block, and not for
-    ///   `StmtKind::Local` which binds values => the io amount is used.
+    ///   `StmtKind::Let` which binds values => the io amount is used.
     ///
     /// To check for unused io amount in stmts, we only consider `StmtKind::Semi`.
-    /// `StmtKind::Local` is not considered because it binds values => the io amount is used.
+    /// `StmtKind::Let` is not considered because it binds values => the io amount is used.
     /// `StmtKind::Expr` is not considered because requires unit type => the io amount is used.
     /// `StmtKind::Item` is not considered because it's not an expression.
     ///
@@ -75,6 +83,28 @@ impl<'tcx> LateLintPass<'tcx> for UnusedIoAmount {
     /// to consider the arms, and we want to avoid breaking the logic for situations where things
     /// get desugared to match.
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx hir::Block<'tcx>) {
+        let fn_def_id = block.hir_id.owner.to_def_id();
+        if let Some(impl_id) = cx.tcx.impl_of_method(fn_def_id)
+            && let Some(trait_id) = cx.tcx.trait_id_of_impl(impl_id)
+        {
+            // We don't want to lint inside io::Read or io::Write implementations, as the author has more
+            // information about their trait implementation than our lint, see https://github.com/rust-lang/rust-clippy/issues/4836
+            if cx.tcx.is_diagnostic_item(sym::IoRead, trait_id) || cx.tcx.is_diagnostic_item(sym::IoWrite, trait_id) {
+                return;
+            }
+
+            let async_paths: [&[&str]; 4] = [
+                &paths::TOKIO_IO_ASYNCREADEXT,
+                &paths::TOKIO_IO_ASYNCWRITEEXT,
+                &paths::FUTURES_IO_ASYNCREADEXT,
+                &paths::FUTURES_IO_ASYNCWRITEEXT,
+            ];
+
+            if async_paths.into_iter().any(|path| match_def_path(cx, trait_id, path)) {
+                return;
+            }
+        }
+
         for stmt in block.stmts {
             if let hir::StmtKind::Semi(exp) = stmt.kind {
                 check_expr(cx, exp);
@@ -82,42 +112,77 @@ impl<'tcx> LateLintPass<'tcx> for UnusedIoAmount {
         }
 
         if let Some(exp) = block.expr
-            && matches!(exp.kind, hir::ExprKind::If(_, _, _) | hir::ExprKind::Match(_, _, _))
+            && matches!(
+                exp.kind,
+                ExprKind::If(_, _, _) | ExprKind::Match(_, _, hir::MatchSource::Normal)
+            )
         {
             check_expr(cx, exp);
         }
     }
 }
 
+fn non_consuming_err_arm<'a>(cx: &LateContext<'a>, arm: &hir::Arm<'a>) -> bool {
+    // if there is a guard, we consider the result to be consumed
+    if arm.guard.is_some() {
+        return false;
+    }
+    if is_unreachable_or_panic(cx, arm.body) {
+        // if the body is unreachable or there is a panic,
+        // we consider the result to be consumed
+        return false;
+    }
+
+    if let PatKind::TupleStruct(ref path, [inner_pat], _) = arm.pat.kind {
+        return is_res_lang_ctor(cx, cx.qpath_res(path, inner_pat.hir_id), hir::LangItem::ResultErr);
+    }
+
+    false
+}
+
+fn non_consuming_ok_arm<'a>(cx: &LateContext<'a>, arm: &hir::Arm<'a>) -> bool {
+    // if there is a guard, we consider the result to be consumed
+    if arm.guard.is_some() {
+        return false;
+    }
+    if is_unreachable_or_panic(cx, arm.body) {
+        // if the body is unreachable or there is a panic,
+        // we consider the result to be consumed
+        return false;
+    }
+
+    if is_ok_wild_or_dotdot_pattern(cx, arm.pat) {
+        return true;
+    }
+    false
+}
+
 fn check_expr<'a>(cx: &LateContext<'a>, expr: &'a hir::Expr<'a>) {
     match expr.kind {
-        hir::ExprKind::If(cond, _, _)
-            if let ExprKind::Let(hir::Let { pat, init, .. }) = cond.kind
-                && pattern_is_ignored_ok(cx, pat)
+        ExprKind::If(cond, _, _)
+            if let ExprKind::Let(hir::LetExpr { pat, init, .. }) = cond.kind
+                && is_ok_wild_or_dotdot_pattern(cx, pat)
                 && let Some(op) = should_lint(cx, init) =>
         {
-            emit_lint(cx, cond.span, op, &[pat.span]);
+            emit_lint(cx, cond.span, cond.hir_id, op, &[pat.span]);
         },
-        hir::ExprKind::Match(expr, arms, hir::MatchSource::Normal) if let Some(op) = should_lint(cx, expr) => {
-            let found_arms: Vec<_> = arms
-                .iter()
-                .filter_map(|arm| {
-                    if pattern_is_ignored_ok(cx, arm.pat) {
-                        Some(arm.span)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !found_arms.is_empty() {
-                emit_lint(cx, expr.span, op, found_arms.as_slice());
+        // we will capture only the case where the match is Ok( ) or Err( )
+        // prefer to match the minimum possible, and expand later if needed
+        // to avoid false positives on something as used as this
+        ExprKind::Match(expr, [arm1, arm2], hir::MatchSource::Normal) if let Some(op) = should_lint(cx, expr) => {
+            if non_consuming_ok_arm(cx, arm1) && non_consuming_err_arm(cx, arm2) {
+                emit_lint(cx, expr.span, expr.hir_id, op, &[arm1.pat.span]);
+            }
+            if non_consuming_ok_arm(cx, arm2) && non_consuming_err_arm(cx, arm1) {
+                emit_lint(cx, expr.span, expr.hir_id, op, &[arm2.pat.span]);
             }
         },
+        ExprKind::Match(_, _, hir::MatchSource::Normal) => {},
         _ if let Some(op) = should_lint(cx, expr) => {
-            emit_lint(cx, expr.span, op, &[]);
+            emit_lint(cx, expr.span, expr.hir_id, op, &[]);
         },
         _ => {},
-    };
+    }
 }
 
 fn should_lint<'a>(cx: &LateContext<'a>, mut inner: &'a hir::Expr<'a>) -> Option<IoOp> {
@@ -130,27 +195,42 @@ fn should_lint<'a>(cx: &LateContext<'a>, mut inner: &'a hir::Expr<'a>) -> Option
     check_io_mode(cx, inner)
 }
 
-fn pattern_is_ignored_ok(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> bool {
+fn is_ok_wild_or_dotdot_pattern<'a>(cx: &LateContext<'a>, pat: &hir::Pat<'a>) -> bool {
     // the if checks whether we are in a result Ok( ) pattern
     // and the return checks whether it is unhandled
 
-    if let PatKind::TupleStruct(ref path, inner_pat, ddp) = pat.kind
+    if let PatKind::TupleStruct(ref path, inner_pat, _) = pat.kind
         // we check against Result::Ok to avoid linting on Err(_) or something else.
         && is_res_lang_ctor(cx, cx.qpath_res(path, pat.hir_id), hir::LangItem::ResultOk)
     {
-        return match (inner_pat, ddp.as_opt_usize()) {
-            // Ok(_) pattern
-            ([inner_pat], None) if matches!(inner_pat.kind, PatKind::Wild) => true,
-            // Ok(..) pattern
-            ([], Some(0)) => true,
-            _ => false,
-        };
+        if matches!(inner_pat, []) {
+            return true;
+        }
+
+        if let [cons_pat] = inner_pat
+            && matches!(cons_pat.kind, PatKind::Wild)
+        {
+            return true;
+        }
+        return false;
     }
     false
 }
 
+// this is partially taken from panic_unimplemented
+fn is_unreachable_or_panic(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
+    let expr = peel_blocks(expr);
+    let Some(macro_call) = root_macro_call_first_node(cx, expr) else {
+        return false;
+    };
+    if is_panic(cx, macro_call.def_id) {
+        return !cx.tcx.hir_is_inside_const_context(expr.hir_id);
+    }
+    matches!(cx.tcx.item_name(macro_call.def_id).as_str(), "unreachable")
+}
+
 fn unpack_call_chain<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
-    while let hir::ExprKind::MethodCall(path, receiver, ..) = expr.kind {
+    while let ExprKind::MethodCall(path, receiver, ..) = expr.kind {
         if matches!(
             path.ident.as_str(),
             "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else" | "ok" | "is_ok" | "is_err" | "or_else" | "or"
@@ -164,10 +244,10 @@ fn unpack_call_chain<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
 }
 
 fn unpack_try<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
-    while let hir::ExprKind::Call(func, [ref arg_0, ..]) = expr.kind
+    while let ExprKind::Call(func, [arg_0]) = expr.kind
         && matches!(
             func.kind,
-            hir::ExprKind::Path(hir::QPath::LangItem(hir::LangItem::TryTraitBranch, ..))
+            ExprKind::Path(hir::QPath::LangItem(hir::LangItem::TryTraitBranch, ..))
         )
     {
         expr = arg_0;
@@ -176,7 +256,7 @@ fn unpack_try<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
 }
 
 fn unpack_match<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
-    while let hir::ExprKind::Match(res, _, _) = expr.kind {
+    while let ExprKind::Match(res, _, _) = expr.kind {
         expr = res;
     }
     expr
@@ -184,23 +264,22 @@ fn unpack_match<'a>(mut expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
 
 /// If `expr` is an (e).await, return the inner expression "e" that's being
 /// waited on.  Otherwise return None.
-fn unpack_await<'a>(expr: &'a hir::Expr<'a>) -> &hir::Expr<'a> {
-    if let hir::ExprKind::Match(expr, _, hir::MatchSource::AwaitDesugar) = expr.kind {
-        if let hir::ExprKind::Call(func, [ref arg_0, ..]) = expr.kind {
-            if matches!(
-                func.kind,
-                hir::ExprKind::Path(hir::QPath::LangItem(hir::LangItem::IntoFutureIntoFuture, ..))
-            ) {
-                return arg_0;
-            }
-        }
+fn unpack_await<'a>(expr: &'a hir::Expr<'a>) -> &'a hir::Expr<'a> {
+    if let ExprKind::Match(expr, _, hir::MatchSource::AwaitDesugar) = expr.kind
+        && let ExprKind::Call(func, [arg_0]) = expr.kind
+        && matches!(
+            func.kind,
+            ExprKind::Path(hir::QPath::LangItem(hir::LangItem::IntoFutureIntoFuture, ..))
+        )
+    {
+        return arg_0;
     }
     expr
 }
 
 /// Check whether the current expr is a function call for an IO operation
 fn check_io_mode(cx: &LateContext<'_>, call: &hir::Expr<'_>) -> Option<IoOp> {
-    let hir::ExprKind::MethodCall(path, ..) = call.kind else {
+    let ExprKind::MethodCall(path, ..) = call.kind else {
         return None;
     };
 
@@ -228,7 +307,7 @@ fn check_io_mode(cx: &LateContext<'_>, call: &hir::Expr<'_>) -> Option<IoOp> {
     }
 }
 
-fn emit_lint(cx: &LateContext<'_>, span: Span, op: IoOp, wild_cards: &[Span]) {
+fn emit_lint(cx: &LateContext<'_>, span: Span, at: HirId, op: IoOp, wild_cards: &[Span]) {
     let (msg, help) = match op {
         IoOp::AsyncRead(false) => (
             "read amount is not handled",
@@ -250,7 +329,7 @@ fn emit_lint(cx: &LateContext<'_>, span: Span, op: IoOp, wild_cards: &[Span]) {
         IoOp::SyncWrite(true) | IoOp::AsyncWrite(true) => ("written amount is not handled", None),
     };
 
-    span_lint_and_then(cx, UNUSED_IO_AMOUNT, span, msg, |diag| {
+    span_lint_hir_and_then(cx, UNUSED_IO_AMOUNT, at, span, msg, |diag| {
         if let Some(help_str) = help {
             diag.help(help_str);
         }
